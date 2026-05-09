@@ -1,0 +1,7 @@
+node_modules/
+.env
+.env.local
+
+# 运行时产物：包含私钥，绝不能提交！
+data/
+*.log

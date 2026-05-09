@@ -1,0 +1,38 @@
+{
+  "name": "claim-test-usdc",
+  "version": "1.0.0",
+  "description": "批量从 Circle Faucet 领取 Solana Devnet Test USDC 并归集到指定地址",
+  "main": "src/index.ts",
+  "type": "module",
+  "scripts": {
+    "generate": "tsx src/generate.ts",
+    "fund": "tsx src/fund.ts",
+    "claim": "tsx src/claim.ts",
+    "consolidate": "tsx src/consolidate.ts",
+    "balances": "tsx src/balances.ts",
+    "all": "npm run generate && npm run fund && npm run claim && npm run consolidate"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/alandxs/claim-test-usdc.git"
+  },
+  "keywords": ["solana", "usdc", "circle", "faucet", "devnet"],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/alandxs/claim-test-usdc/issues"
+  },
+  "homepage": "https://github.com/alandxs/claim-test-usdc#readme",
+  "dependencies": {
+    "@solana/spl-token": "^0.4.14",
+    "@solana/web3.js": "^1.98.4",
+    "bs58": "^6.0.0",
+    "dotenv": "^17.4.2",
+    "playwright": "^1.59.1"
+  },
+  "devDependencies": {
+    "@types/node": "^25.6.2",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.3"
+  }
+}
