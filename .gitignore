@@ -5,3 +5,6 @@ node_modules/
 # 运行时产物：包含私钥，绝不能提交！
 data/
 *.log
+
+# Playwright 持久化浏览器 profile（含 cookies / cache，体积大且包含敏感会话）
+.browser-profile/
