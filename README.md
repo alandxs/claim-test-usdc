@@ -11,7 +11,7 @@ Circle 水龙头按 **接收地址** 限速（每 2 小时 / 每对网络+币种
 
 1. 生成 100 个全新临时 Solana 账户（保存私钥到本地）；
 2. 你提供的"资助账户"给每个临时账户分发少量 Devnet SOL 作 gas；
-3. 用 Playwright 启动一个真实 Chromium 窗口，依次自动填入 100 个地址，**reCAPTCHA 由你手动点**（脚本会等响应）；
+3. 用 Playwright 启动一个真实 Chromium 窗口，依次自动填入 100 个地址；**reCAPTCHA 通过 2Captcha API 全自动解题**，整个领取过程无需人工干预；
 4. 全部领完后，逐个把临时账户里的 USDC 转入目标地址，并顺手关闭临时 ATA 把租金 SOL 回收给资助账户。
 
 最终目标地址会收到 100 × 20 = **2000 Devnet USDC**。
@@ -24,16 +24,23 @@ npx playwright install chromium
 cp .env.example .env
 ```
 
+然后去 [2Captcha](https://2captcha.com/) 注册并充值（$3 够用），把 API Key 填入 `.env` 的 `TWOCAPTCHA_API_KEY`。
+
 ## 配置 `.env`
 
 | 变量 | 必填 | 说明 |
 |---|---|---|
 | `TARGET_ADDRESS` | ✅ | 归集目标地址（默认已填入题目要求的地址） |
 | `FUNDER_SECRET_KEY` | ✅ | 资助账户私钥（base58 字符串 **或** Solana CLI 风格的 `[1,2,3,...]` JSON 数组）。该账户需要在 Devnet 至少有 ~1 SOL（去 https://faucet.solana.com 领取） |
+| `TWOCAPTCHA_API_KEY` | ✅ | [2Captcha](https://2captcha.com/) 的 API Key，用于自动解 reCAPTCHA Enterprise。100 个账户预算约 $0.6（一次领取通常 2 次解题：v3 + v2 fallback ≈ $0.006/账户） |
 | `SOL_PER_ACCOUNT` |  | 每个临时账户分发多少 SOL，默认 `0.005` 已经足够开 ATA + 转账 + 关 ATA |
 | `ACCOUNT_COUNT` |  | 想生成多少个账户，默认 `100` |
 | `SOLANA_RPC_URL` |  | RPC，默认 `https://api.devnet.solana.com`。如频繁 429，建议换成 Helius / QuickNode 的 Devnet 节点 |
 | `USDC_MINT` |  | Devnet USDC mint，默认即 `4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU` |
+| `TWOCAPTCHA_TIMEOUT_MS` |  | 单次 2Captcha 解题超时，默认 `180000`（3 分钟） |
+| `TWOCAPTCHA_V3_MIN_SCORE` |  | v3 解题分数下限，默认 `0.7` |
+| `CLAIM_HARD_TIMEOUT_MS` |  | 单账户最长尝试时间，超时跳过下次再试，默认 `300000`（5 分钟） |
+| `CLAIM_STUCK_RETRIGGER_MS` |  | 卡顿心跳间隔，默认 `30000`（30 秒打印一次当前状态） |
 
 ## 一键运行
 
@@ -59,7 +66,7 @@ npm run fund
 
 每 10 个账户合并到一个 tx，共发 10 次。
 
-### 3. 领取 USDC（半自动）
+### 3. 领取 USDC（全自动，2Captcha 解 reCAPTCHA）
 
 ```bash
 npm run claim
@@ -67,13 +74,28 @@ npm run claim
 
 脚本会：
 
-- 启动 Chromium 窗口，自动选好 `Network = Solana Devnet` + `Token = USDC`；
+- 启动 Chromium 窗口（持久化 profile 在 `.browser-profile/`），自动选好 `Network = Solana Devnet` + `Token = USDC`；
 - 循环每个账户：自动填地址、自动点 `Send 20 USDC` 按钮；
-- **你只需要点一次 reCAPTCHA 复选框**（如果出现图片挑战就解一下）；
-- 脚本检测到 GraphQL 响应后自动进入下一个；
-- 中断了再次运行 `npm run claim` 会从未完成处续跑（用 `data/progress.json` 记录进度）。
+- **reCAPTCHA 全程由 2Captcha 自动解题，无需人工**；
+- 每个账户成功后 `page.reload()` 让状态归零，再处理下一个；
+- 中断了再次运行 `npm run claim` 会从未完成处续跑（用 `data/progress.json` 记录进度）；
+- 单账户卡超过 5 分钟会被 hard timeout 自动跳过，**再跑一遍 `npm run claim` 会自动重试这些跳过的账户**。
 
-> 因为 reCAPTCHA Enterprise 有反自动化检测，**不要把鼠标放着不管**——保持窗口在前台、偶尔挪一下鼠标，通过率更高。
+终端命令：`s + 回车` 跳过当前；`q + 回车` 处理完当前账户后退出。
+
+> 单账户耗时约 90–120s（v3 解题 ≈ 30s + v2 fallback 解题 ≈ 30s + 链上确认 ≈ 30s），100 个账户大约 **2.5–3.5 小时**。
+> 不需要把窗口放在前台，可以最小化、可以挂着干别的事。
+
+#### reCAPTCHA 自动化原理（技术细节）
+
+Circle Faucet 用 **reCAPTCHA Enterprise v3 + v2 复选框 fallback** 混合模式：
+
+1. **劫持 `grecaptcha.execute`**：脚本启动时通过 `addInitScript` 注入一段 JS，用 `Object.defineProperty` 在 `window.grecaptcha` 被赋值的瞬间拦截，并用 setInterval 直接包装真实对象上的 `execute`（含 `.enterprise.execute`）。所以**前端无论怎么调 grecaptcha，拿到的 token 都来自我们的 2Captcha**。
+2. **v3 解题 + Enterprise**：2Captcha 提交 `userrecaptcha + version=v3 + enterprise=1 + action=request_token`（action 是从劫持日志里读出来的真实值），返回 token 给前端。
+3. **Circle 后端依然可能拒绝 v3 token**（自动化客户端的 IP 评分通常不够），此时页面会弹出 v2 复选框 fallback。
+4. **v2 监听器接管**：后台监听 `iframe[src*="recaptcha"][src*="anchor"]` 出现 → 调 2Captcha 解 v2 enterprise → 通过 `___grecaptcha_cfg.clients` 遍历找到 callback 调用注入 token → 再次点 Send。
+
+> 即使 v2 注入偶发失败（约 25% 概率，React 内部 state 同步问题），hard timeout 跳过后**再跑一遍 `npm run claim`** 就能补完。
 
 ### 4. 归集到目标地址
 
@@ -113,10 +135,13 @@ data/
 ## 常见问题
 
 **Q: 为什么不直接用 Circle 官方 `/v1/faucet/drips` API？**
-A: 那个 API 每个开发者 API Key 每天只能领 5–10 次，100 次需要 10–20 个不同账号的 Key，反而比手点 reCAPTCHA 麻烦。
+A: 那个 API 每个开发者 API Key 每天只能领 5–10 次，100 次需要 10–20 个不同账号的 Key，反而比浏览器自动化 + 2Captcha 麻烦。
 
-**Q: 我能完全自动化（不点 reCAPTCHA）吗？**
-A: 可以，把 `claim.ts` 里调用 reCAPTCHA 解题服务（2Captcha / CapSolver）的 token 注入到 GraphQL 请求里，但需要付费 API Key（≈ $0.003/次）。本脚本默认不集成。
+**Q: 一定要用 2Captcha 吗？能不能换 CapSolver / AntiCaptcha？**
+A: 当前 `claim.ts` 只对接了 2Captcha 的 API（[in.php/res.php](https://2captcha.com/2captcha-api)）。CapSolver / AntiCaptcha 的接口类似，改 `solveRecaptchaV3` / `solveRecaptchaV2` 里的 URL 和参数名即可。
+
+**Q: 2Captcha 大概花多少钱？**
+A: 当前定价 v2 ≈ $2.99 / 1000 次、v3 ≈ $2.99 / 1000 次。本脚本每个账户**通常 2 次解题**（v3 必然被拒、再 v2 fallback），所以 100 个账户≈ $0.6。被 hard timeout 跳过重试的账户每次会多花一遍，按 1.5 倍预算 $1 充值绰绰有余。
 
 **Q: 临时账户收了 20 USDC，还需要 SOL 吗？**
 A: 需要。Solana 上 SPL Token 的 ATA 在第一次接收时会被 Circle 帮我们建好（gas 由水龙头出），但 **从临时账户转出 USDC 时**必须由账户自己付 ~5000 lamports 的 gas。所以每个临时账户至少要有几千 lamports。脚本默认给 0.005 SOL，富余很多。
