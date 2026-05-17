@@ -37,7 +37,7 @@ const PER_REQUEST_TIMEOUT_MS =
 // 链上确认 USDC 到账的最长等待时间 / 轮询间隔
 const ONCHAIN_CONFIRM_TIMEOUT_MS =
   Number.parseInt(process.env.CLAIM_ONCHAIN_CONFIRM_MS ?? "", 10) || 90_000;
-const ONCHAIN_POLL_INTERVAL_MS = 3_000;
+const ONCHAIN_POLL_INTERVAL_MS = 2_000;
 
 // 浏览器持久化 profile 路径（让 reCAPTCHA 信任度更高）
 const BROWSER_PROFILE_DIR = path.resolve(
@@ -49,7 +49,8 @@ const BROWSER_PROFILE_DIR = path.resolve(
 const TWOCAPTCHA_API_KEY = (process.env.TWOCAPTCHA_API_KEY ?? "").trim();
 const TWOCAPTCHA_TIMEOUT_MS =
   Number.parseInt(process.env.TWOCAPTCHA_TIMEOUT_MS ?? "", 10) || 180_000;
-const TWOCAPTCHA_POLL_INTERVAL_MS = 5_000;
+const TWOCAPTCHA_POLL_INTERVAL_MS = 3_000;
+const TWOCAPTCHA_INITIAL_DELAY_MS = 10_000;
 const TWOCAPTCHA_V3_MIN_SCORE = process.env.TWOCAPTCHA_V3_MIN_SCORE ?? "0.7";
 
 // 卡顿心跳：N 秒没收到 GraphQL 响应就输出一次状态、并在 Send 重新 enable 时再点一次
@@ -154,17 +155,19 @@ async function submitAndPoll2Captcha(
       return null;
     }
     captchaId = body.request;
-    console.log(
-      `  [2Captcha] 已提交 (id=${captchaId}, ${params.version ?? "v2"})，等待解题...`,
-    );
   } catch (err) {
     console.error(`  [2Captcha] 提交异常: ${(err as Error).message}`);
     return null;
   }
 
-  const deadline = Date.now() + TWOCAPTCHA_TIMEOUT_MS;
-  // 首次稍等久一点（2Captcha 解 reCAPTCHA 通常 15-90s）
-  await new Promise((r) => setTimeout(r, 15_000));
+  const submittedAt = Date.now();
+  console.log(
+    `  [2Captcha] 提交 ${params.version ?? "v2"} 任务 #${captchaId}，等待解题...`,
+  );
+
+  const deadline = submittedAt + TWOCAPTCHA_TIMEOUT_MS;
+  // 首次等一会再开始轮询（2Captcha 解 reCAPTCHA 通常 15-30s，太早 ping 也是 NOT_READY）
+  await new Promise((r) => setTimeout(r, TWOCAPTCHA_INITIAL_DELAY_MS));
   while (Date.now() < deadline) {
     try {
       const resUrl = new URL("https://2captcha.com/res.php");
@@ -175,9 +178,8 @@ async function submitAndPoll2Captcha(
       const r = await fetch(resUrl.toString());
       const rb = (await r.json()) as { status: number; request: string };
       if (rb.status === 1) {
-        console.log(
-          `  [2Captcha] 解出 token ✓ (id=${captchaId}, ${rb.request.slice(0, 24)}...)`,
-        );
+        const tookSec = ((Date.now() - submittedAt) / 1000).toFixed(1);
+        console.log(`  [2Captcha] ✓ 解出 token (${tookSec}s)`);
         return rb.request;
       }
       if (rb.request !== "CAPCHA_NOT_READY") {
@@ -236,21 +238,19 @@ async function installRecaptchaHijack(context: BrowserContext): Promise<void> {
   await context.exposeFunction(
     "__cursorSolveRecaptchaV3",
     async (sitekey: string, action: string): Promise<string | null> => {
-      console.log(
-        `>>> [劫持] grecaptcha.execute(${sitekey.slice(0, 10)}..., action=${action}) → 调 2Captcha 解 v3`,
-      );
+      console.log(`  → 调 2Captcha 解 v3 (action=${action})`);
       const token = await solveRecaptchaV3(sitekey, FAUCET_URL, action).catch(
         (err) => {
-          console.warn(`  [劫持] solveRecaptchaV3 异常: ${err?.message}`);
+          console.warn(`  ✗ 2Captcha v3 异常: ${err?.message}`);
           return null;
         },
       );
       return token;
     },
   );
-  // 2) 把劫持脚本里的 console.log 转发到 Node 端（保证一定能看到诊断日志）
+  // 2) 劫持脚本的关键日志回传到 Node 端打印（只打关键节点，不打 verbose）
   await context.exposeFunction("__cursorHijackLog", (msg: string) => {
-    console.log(`  [hijack-log] ${msg}`);
+    console.log(`  [hijack] ${msg}`);
   });
 
   // 3) 在每个页面加载前注入劫持脚本。
@@ -260,29 +260,22 @@ async function installRecaptchaHijack(context: BrowserContext): Promise<void> {
   const HIJACK_SCRIPT = `
 (function () {
   var w = window;
+  // HLOG 只把日志回传到 Node 端打印一次，浏览器 console 不再重复打（避免一条日志两份）
   function HLOG(m) {
     try { if (w.__cursorHijackLog) w.__cursorHijackLog(String(m)); } catch (e) {}
-    try { console.log('[hijack] ' + m); } catch (e) {}
   }
-  HLOG('init script loaded, installing grecaptcha hijack');
 
   function wrapExecute(orig) {
     return function (siteKey, opts) {
       var sk = typeof siteKey === 'string' ? siteKey : '';
       var action = (opts && typeof opts.action === 'string' && opts.action) || 'submit';
-      HLOG('grecaptcha.execute called sitekey=' + sk.slice(0, 12) + '... action=' + action);
+      HLOG('grecaptcha.execute 拦截 sitekey=' + sk.slice(0, 12) + '... action=' + action);
       var p = (async function () {
         if (sk && w.__cursorSolveRecaptchaV3) {
           try {
             var t = await w.__cursorSolveRecaptchaV3(sk, action);
-            if (t && typeof t === 'string' && t.length > 20) {
-              HLOG('✓ 2Captcha token (' + t.length + ' chars) 返回给前端');
-              return t;
-            }
-            HLOG('2Captcha 返回空，fallback 到原始 execute');
-          } catch (e) {
-            HLOG('2Captcha 调用异常 fallback: ' + e);
-          }
+            if (t && typeof t === 'string' && t.length > 20) return t;
+          } catch (e) { /* fallback */ }
         }
         if (typeof orig === 'function') return orig(siteKey, opts);
         throw new Error('[hijack] no original grecaptcha.execute available');
@@ -310,12 +303,8 @@ async function installRecaptchaHijack(context: BrowserContext): Promise<void> {
       configurable: true,
       enumerable: true,
       get: function () { return _grecaptcha ? buildProxy(_grecaptcha) : undefined; },
-      set: function (v) {
-        _grecaptcha = v;
-        HLOG('window.grecaptcha 被赋值 (execute=' + (typeof (v && v.execute)) + ', enterprise=' + !!(v && v.enterprise) + ')');
-      }
+      set: function (v) { _grecaptcha = v; }
     });
-    HLOG('window.grecaptcha 读写已被代理，等待 reCAPTCHA 脚本加载');
   } catch (e) {
     HLOG('安装 grecaptcha 代理失败: ' + e);
   }
@@ -328,18 +317,20 @@ async function installRecaptchaHijack(context: BrowserContext): Promise<void> {
   // 这样无论 reCAPTCHA 内部怎么持有 execute 引用都会拿到 wrap 版。
   var _patchedExecuteRef = null;
   var _patchedEnterpriseRef = null;
+  var _firstPatchLogged = { main: false, enterprise: false };
   function patchDirectly(obj, label) {
     if (!obj) return;
     if (typeof obj.execute === 'function') {
-      // 已经包装过同一个 ref 则跳过
       var ref = obj.execute;
       if ((label === 'main' && _patchedExecuteRef === ref) ||
           (label === 'enterprise' && _patchedEnterpriseRef === ref)) return;
-      var orig = ref;
-      obj.execute = wrapExecute(orig);
+      obj.execute = wrapExecute(ref);
       if (label === 'main') _patchedExecuteRef = obj.execute;
       else _patchedEnterpriseRef = obj.execute;
-      HLOG('✓ 直接替换 _grecaptcha' + (label === 'enterprise' ? '.enterprise' : '') + '.execute（已包装）');
+      if (!_firstPatchLogged[label]) {
+        _firstPatchLogged[label] = true;
+        HLOG('✓ grecaptcha' + (label === 'enterprise' ? '.enterprise' : '') + '.execute 已包装');
+      }
     }
   }
   setInterval(function () {
@@ -420,7 +411,7 @@ async function dismissCookieBannerIfPresent(page: Page): Promise<void> {
 
 async function setupFaucetPage(page: Page) {
   await page.goto(FAUCET_URL, { waitUntil: "domcontentloaded" });
-  await page.waitForTimeout(800);
+  await page.waitForTimeout(500);
   await dismissCookieBannerIfPresent(page).catch(() => undefined);
   await ensureNetworkAndToken(page);
   console.log("已自动选好 Network=Solana Devnet, Token=USDC");
@@ -611,7 +602,7 @@ function startV2FallbackMonitor(page: Page): { stop: () => void } {
   let stopped = false;
   let solving = false;
   let lastInjectedAt = 0;
-  const COOLDOWN_MS = 25_000;
+  const COOLDOWN_MS = 18_000;
 
   async function anchorVisible(): Promise<boolean> {
     const a = page.locator('iframe[src*="recaptcha"][src*="anchor"]').first();
@@ -718,7 +709,7 @@ function startV2FallbackMonitor(page: Page): { stop: () => void } {
             continue;
           }
           solving = true;
-          console.log(`>>> [v2 监听器] 检测到 v2 复选框，调 2Captcha 解 v2...`);
+          console.log(`  [v2 监听器] 检测到 v2 复选框，开始解题...`);
           try {
             const sitekey = await findV2Sitekey();
             const token = await solveRecaptchaV2(sitekey, FAUCET_URL);
@@ -726,12 +717,11 @@ function startV2FallbackMonitor(page: Page): { stop: () => void } {
               const injected = await injectV2Token(token);
               if (injected) {
                 lastInjectedAt = Date.now();
-                console.log(`✓ [v2 监听器] token 注入，等 Send enable 后再点...`);
-                await page.waitForTimeout(1_500);
+                await page.waitForTimeout(1_000);
                 const clicked = await clickSendButton(page, 10_000).catch(
                   () => false,
                 );
-                if (clicked) console.log(`✓ [v2 监听器] 已自动重新点 Send`);
+                if (clicked) console.log(`  [v2 监听器] ✓ token 注入完成，已重新点 Send`);
               }
             }
           } catch (err) {
@@ -743,7 +733,7 @@ function startV2FallbackMonitor(page: Page): { stop: () => void } {
       } catch {
         /* ignore */
       }
-      await new Promise((r) => setTimeout(r, 1_200));
+      await new Promise((r) => setTimeout(r, 1_000));
     }
   })();
 
@@ -818,7 +808,7 @@ async function claimOne(
     delay: 18 + Math.random() * 25,
   });
   await page.keyboard.press("Tab").catch(() => undefined);
-  await page.waitForTimeout(500 + Math.random() * 300);
+  await page.waitForTimeout(300 + Math.random() * 200);
 
   // 2) 启动 v2 fallback 监听器（万一 v3 token 被拒绝走到 v2 复选框）
   const monitor = startV2FallbackMonitor(page);
@@ -828,7 +818,7 @@ async function claimOne(
   //    2Captcha 解出来的 v3 token，整个流程一气呵成。
   const firstClicked = await clickSendButton(page, 10_000);
   if (firstClicked) {
-    console.log(`✓ 已点击 Send（第 1 次），等待 reCAPTCHA + GraphQL 响应...`);
+    console.log(`✓ 已点击 Send，等待 reCAPTCHA + GraphQL...`);
   } else {
     console.warn(`⚠️  自动点击 Send 失败，请手动点；或 s 跳过`);
     // 给一个鼠标"路过"动作让 Send 按钮重新被视为已 hover，再试一次
@@ -905,12 +895,12 @@ async function claimOne(
     }
     if (winner.kind === "heartbeat") {
       const st = await readClaimStatus(page);
-      console.log(
-        `… 等响应中（已 ${(attempt * STUCK_RETRIGGER_MS) / 1000}s），状态=${st}`,
-      );
-      // Send 按钮重新 enable 且没有挑战在跑 → 前一次提交失败，自动再点一次
+      const elapsed = (attempt * STUCK_RETRIGGER_MS) / 1000;
+      // 只在卡很久（>=60s）或状态值得关注时打印心跳，避免太啰嗦
+      if (elapsed >= 60 || st === "send-enabled-no-captcha") {
+        console.log(`… 等响应中 ${elapsed}s (state=${st})`);
+      }
       if (st === "send-enabled-no-captcha") {
-        console.log(`>>> Send 重新可点，自动再点一次`);
         await clickSendButton(page, 5_000).catch(() => false);
       }
       continue;
@@ -929,33 +919,21 @@ async function claimOne(
     const ok = status >= 200 && status < 300 && !!bodyObj?.data && !hasErrors;
 
     if (ok) {
-      console.log(
-        `… GraphQL 返回成功，校验链上是否真的到账（最多 ${
-          ONCHAIN_CONFIRM_TIMEOUT_MS / 1000
-        }s）...`,
-      );
+      console.log(`… GraphQL 成功，校验链上到账...`);
       const amount = await waitForOnChainReceipt(connection, address);
       if (amount > 0n) {
         monitor.stop();
-        try {
-          await page.waitForTimeout(1_000);
-          await clickGetMoreTokensIfPresent(page);
-        } catch {
-          /* ignore */
-        }
+        // 不点 "Get more tokens"，下个账户会直接 page.reload() 重新走流程
         return { success: true, attempts: attempt, onChainAmount: amount };
       }
-      console.warn(
-        `⚠️  GraphQL 200 但链上还查不到 USDC，继续等下一次响应（或 s 跳过）`,
-      );
+      console.warn(`⚠️  GraphQL 200 但链上未到账，继续等下一次响应`);
       continue;
     }
 
-    const preview = JSON.stringify(body).slice(0, 240);
-    console.log(`✗ GraphQL 失败 status=${status} body=${preview}`);
+    const preview = JSON.stringify(body).slice(0, 200);
     const errMsg = preview.toLowerCase();
     if (status === 429 || /limit|rate/i.test(preview)) {
-      console.warn(`>>> 触发限流/速率上限，跳过此账户`);
+      console.warn(`✗ 触发限流，跳过此账户 (status=${status})`);
       monitor.stop();
       return {
         success: false,
@@ -964,31 +942,13 @@ async function claimOne(
       };
     }
     if (errMsg.includes("recaptcha") || errMsg.includes("captcha")) {
-      console.log(
-        `>>> reCAPTCHA token 被后端拒绝。等待 v2 复选框出现 / 监听器自动接管，最多 90s`,
-      );
-      // 关键：不要立刻 form.submit() 重复打后端，那只会得到同样的失败。
-      // 正确的做法是：
-      //   - 等几秒让 Circle 前端把 v2 复选框 anchor iframe 渲染出来
-      //   - 监听器（startV2FallbackMonitor）会自动检测到 anchor → 调 2Captcha v2 → 注入 → 再点 Send
-      // 这里只需要被动等下一次 GraphQL 响应即可。
+      console.log(`✗ v3 token 被拒，等 v2 复选框出现并由监听器接管...`);
+      // 等几秒让 v2 复选框 anchor iframe 渲染出来 → v2 监听器自动接管
       const v2Deadline = Date.now() + 90_000;
-      let v2AppearedAt: number | null = null;
       while (Date.now() < v2Deadline) {
         const st = await readClaimStatus(page);
-        if (st === "v2-checkbox-pending" || st === "send-enabled-captcha-shown") {
-          if (v2AppearedAt === null) {
-            v2AppearedAt = Date.now();
-            console.log(
-              `… v2 复选框已显示，等待 v2 监听器解题 + 自动注入 token + 再点 Send`,
-            );
-          }
-        }
-        if (st === "token-injected-button-loading") {
-          console.log(`… token 已注入，前端正在校验 / 按钮即将启用`);
-          break;
-        }
-        await new Promise((r) => setTimeout(r, 1_500));
+        if (st === "token-injected-button-loading") break;
+        await new Promise((r) => setTimeout(r, 1_000));
       }
       // 监听器会在 token 注入后自己再点 Send；我们回到主循环继续等下一次 GraphQL 响应
       continue;
@@ -1019,19 +979,16 @@ async function buildContext(): Promise<{
   // 关键：浏览器一打开就装好 reCAPTCHA 劫持，下面 navigate 时已经生效
   await installRecaptchaHijack(context);
   const page = context.pages()[0] ?? (await context.newPage());
-  // 把页面 console 转发出来（只过滤太吵的，确保 [hijack] 日志一定可见）
-  page.on("console", (msg) => {
-    const t = msg.text();
-    // 跳过过于吵闹的 React DevTools / GA 等噪音，但保留所有有用日志
-    if (/devtools|gtag|gtm\.js|analytics\.js|recaptcha\/api|favicon/i.test(t))
-      return;
-    if (msg.type() === "error" || /hijack|grecaptcha|recaptcha|captcha|error/i.test(t)) {
-      console.log(`  [page:${msg.type()}] ${t}`);
-    }
-  });
-  page.on("pageerror", (err) => {
-    console.warn(`  [page:pageerror] ${err.message}`);
-  });
+  // 不再转发浏览器 console（hijack 关键日志已通过 __cursorHijackLog 直接 Node 端打印）
+  // 只在 DEBUG_PAGE_CONSOLE 环境变量开启时才转发，方便排查问题
+  if (process.env.DEBUG_PAGE_CONSOLE) {
+    page.on("console", (msg) => {
+      console.log(`  [page:${msg.type()}] ${msg.text()}`);
+    });
+    page.on("pageerror", (err) => {
+      console.warn(`  [page:pageerror] ${err.message}`);
+    });
+  }
   return { context, page };
 }
 
@@ -1093,14 +1050,7 @@ async function main() {
   console.log(`浏览器 profile 持久化目录：${BROWSER_PROFILE_DIR}`);
 
   const { context, page } = await buildContext();
-  page.on("response", (resp) => {
-    if (
-      resp.url().includes(GRAPHQL_PATH) &&
-      resp.request().method() === "POST"
-    ) {
-      console.log(`[graphql] ${resp.status()} ${resp.url()}`);
-    }
-  });
+  // 不再打印每个 graphql 200（claimOne 自己会打 requestToken 的成功/失败）
   await setupFaucetPage(page);
 
   for (let i = 0; i < pending.length; i++) {
@@ -1116,10 +1066,9 @@ async function main() {
       // 关键：每个新账户开始前完整 reload 一次，让 v3 token / v2 token / React state 都归零
       // 之前直接复用页面会出现：v2 监听器误以为旧 anchor 是新挑战、Send 按钮一直 disabled、
       // page.evaluate 偶发 evaluate-failed 等竞态问题
-      console.log(`  正在刷新页面以清空上一轮 reCAPTCHA 状态...`);
       try {
         await page.goto(FAUCET_URL, { waitUntil: "domcontentloaded", timeout: 30_000 });
-        await page.waitForTimeout(800);
+        await page.waitForTimeout(500);
         await dismissCookieBannerIfPresent(page).catch(() => undefined);
         await ensureNetworkAndToken(page);
       } catch (e) {
@@ -1158,7 +1107,7 @@ async function main() {
       });
       await setupFaucetPage(page).catch(() => undefined);
     }
-    await page.waitForTimeout(1500 + Math.random() * 1000);
+    await page.waitForTimeout(600 + Math.random() * 400);
   }
 
   console.log(
